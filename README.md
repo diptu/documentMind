@@ -168,32 +168,24 @@ flowchart TD
     U[Users from Multiple Organizations] --> WEB[Next.js SaaS Frontend]
     WEB --> API[NestJS API]
     API --> AUTH[Authentication]
-    AUTH --> CTX[Tenant Context and RBAC]
-    CTX --> APP[Tenant-Aware Application Modules]
-
-    APP --> ORG[Organizations and Workspaces]
-    APP --> BILL[Plans and Usage Metering]
-    APP --> DOC[Document Management]
+    AUTH --> CTX[Verified Membership, Tenant Context and RBAC]
+    CTX --> REG[Tenant Registry and Entitlements]
+    REG --> ROUTER[Tenant Data-Plane Router]
+    ROUTER --> POOL[TenantPool - Free]
+    ROUTER --> BRIDGE[TenantBridge - Pro]
+    ROUTER --> SILO[TenantSilo - Enterprise]
+    POOL --> SHARED[Shared Collections, Vectors, Storage and Workers]
+    BRIDGE --> PARTITION[Dedicated Tenant DB / Collections / Storage Namespaces]
+    SILO --> DEDICATED[Dedicated Tenant Data Plane and Worker Pool]
+    API --> APP[Tenant-Aware Application Modules]
+    APP --> BILL[Plans, Quotas and Usage Metering]
     APP --> AUDIT[Audit Logging]
-
-    DOC --> QUEUE[Job Queue / Kafka or Redpanda]
-    QUEUE --> WORKERS[Python OCR and Extraction Workers]
-
-    WORKERS --> OBJ[MinIO Object Storage]
-    WORKERS --> DB[MongoDB]
-    WORKERS --> VEC[Qdrant]
-
-    APP --> RET[Permission-Aware Retrieval]
-    RET --> DB
-    RET --> VEC
-    RET --> RERANK[Hybrid Ranking and Reranking]
-    RERANK --> LLM[Local LLM - Ollama]
-    LLM --> VERIFY[Citation Verification]
-    VERIFY --> RESULT[Grounded Tenant-Scoped Response]
-
-    CACHE[Redis Tenant-Aware Cache] -.-> APP
-    OBS[OpenTelemetry / Prometheus / Grafana] -.-> API
-    OBS -.-> WORKERS
+    APP --> DOC[Document and AI Workflows]
+    DOC --> JOBS[Validated Tenant-Scoped Jobs]
+    JOBS --> WORKERS[Python OCR and Extraction Workers]
+    WORKERS --> ROUTER
+    APP --> OBS[OpenTelemetry / Prometheus / Grafana]
+    WORKERS --> OBS
 ```
 
 ### Architecture Principles
@@ -201,6 +193,12 @@ flowchart TD
 -   Tenant context is established and validated at the backend boundary.
 -   Authorization is enforced in application services and data-access
     layers.
+-   Subscription entitlements select TenantPool, TenantBridge, or
+    TenantSilo through trusted server-side provisioning metadata.
+-   Tenant-aware data-access abstractions route requests to the provisioned
+    data plane; application business logic avoids ad hoc tier checks.
+-   Missing or invalid routing metadata fails closed; there is no implicit
+    fallback to shared resources.
 -   Application data and search results are tenant- and
     permission-scoped.
 -   Original documents and derived artifacts have controlled access
@@ -304,40 +302,56 @@ system is benchmarked.
 
 ## Multi-Tenancy and Data Isolation
 
-### Initial tenancy model
+### Subscription-aware tenant isolation architecture
 
-The initial SaaS deployment uses shared application and database
-infrastructure with logical tenant isolation. This keeps development and
-operations manageable while preserving a path toward dedicated resources
-for enterprise customers.
+EvidenceOS provides three isolation modes selected by trusted, server-side subscription entitlements. The tier changes the infrastructure boundary; it never weakens authentication, authorization, tenant isolation, or workspace permissions.
 
-  -----------------------------------------------------------------------
-  Layer                   Initial strategy        Future scaling option
-  ----------------------- ----------------------- -----------------------
-  Application             Shared Next.js and      Independently scaled
-                          NestJS applications     services
+| Subscription | Isolation mode | Isolation boundary | Intended use |
+|---|---|---|---|
+| Free | **TenantPool** | Shared application, database collections, vector collections, storage namespace, queues, and worker pools; strict tenant-scoped access | Cost-efficient self-service tenants |
+| Pro | **TenantBridge** | Shared application and infrastructure clusters, but dedicated tenant data partitions (MongoDB database, Qdrant collections, storage bucket/namespace, cache and queue namespaces); shared tenant-aware compute | Stronger data separation without dedicated infrastructure |
+| Enterprise | **TenantSilo** | Dedicated tenant data plane: database deployment, vector deployment, storage boundary, encryption keys, queue and worker pool; optional dedicated application and network boundary | Regulated, high-volume, or contractual isolation requirements |
 
-  MongoDB                 Shared database;        Dedicated database for
-                          tenant-scoped records   selected enterprise
-                          and queries             tenants
+#### TenantPool — Free
 
-  Qdrant                  Shared collections with Separate collections or
-                          mandatory tenant and    clusters
-                          permission filters      
+- Shared NestJS application and shared MongoDB collections.
+- Every tenant-owned record carries `tenantId`; workspace-owned records also carry `workspaceId`.
+- Shared Qdrant collections require tenant, workspace, and permission filters on every query.
+- Shared MinIO bucket uses tenant-scoped object keys and server-authorized access.
+- Shared Redis, queues, and workers use tenant-aware keys and validated job context.
+- Enforce per-tenant rate limits, quotas, concurrency caps, and fair-use scheduling to reduce noisy-neighbor effects.
 
-  MinIO                   Tenant-scoped object    Dedicated buckets or
-                          keys and controlled     storage
-                          access                  
+#### TenantBridge — Pro
 
-  Redis                   Tenant-aware cache keys Dedicated instances
+- Keep the application/control plane and infrastructure clusters shared.
+- Provision a dedicated MongoDB database per Pro tenant within the shared MongoDB cluster.
+- Provision dedicated Qdrant collections per tenant within the shared Qdrant cluster.
+- Use a dedicated MinIO bucket per tenant where supported; otherwise use a tenant namespace with strict bucket policies.
+- Use tenant-specific Redis and queue namespaces, with validated tenant context and shared, fairly scheduled workers.
+- Apply tenant-specific encryption-key references, backup, and retention policies where supported.
+- Continue enforcing workspace permissions within each tenant boundary.
 
-  Kafka                   Shared topics with      Dedicated topics or
-                          tenant identity in      clusters
-                          validated event context 
+#### TenantSilo — Enterprise
 
-  Workers                 Shared worker pools     Dedicated worker pools
-                          with tenant-aware jobs  
-  -----------------------------------------------------------------------
+- Provision a dedicated tenant data plane isolated from other tenants.
+- Use a dedicated MongoDB deployment or cluster, Qdrant deployment, object-storage boundary, queue namespace, and worker pool.
+- Use tenant-specific encryption keys and configurable network access, retention, backup, and recovery policies.
+- Offer a dedicated application deployment or private networking when contractual requirements justify it.
+- Support custom capacity, region, recovery objectives, and operational controls as separately provisioned entitlements.
+
+#### Provisioning and data-plane routing
+
+A trusted tenant-provisioning service resolves active subscription entitlements and assigns an isolation mode. A tenant registry stores the selected mode and the identifiers/locations of provisioned resources. Application services use a tenant data-access abstraction to route operations; business logic must not contain ad hoc tier checks or construct resource names from client input.
+
+- Derive tenant identity from the authenticated user's verified membership.
+- Resolve isolation mode and resource locations from trusted server-side tenant registry data.
+- Never accept a client-supplied `tenantId`, tier, isolation mode, database name, collection name, bucket, or queue as proof of access.
+- Fail closed if tenant routing metadata is missing or inconsistent; never fall back to a shared pool implicitly.
+- Provision resources idempotently and record provisioning state, versions, and audit events.
+- Treat upgrades, downgrades, migrations, and offboarding as controlled workflows with validation, backups, reconciliation, and rollback plans.
+- Do not downgrade a tenant's isolation boundary before its data migration and entitlement transition are verified.
+
+A plan change must not silently move customer data. For example, moving from TenantPool to TenantBridge requires provisioning target partitions, copying and validating data, switching the tenant routing record, and retaining a recoverable rollback path. Moving to TenantSilo requires the same controls plus infrastructure provisioning and operational readiness.
 
 ### Tenant-owned data
 
@@ -395,18 +409,35 @@ EvidenceOS is intended to support plan-based SaaS access. The initial
 MVP can use manually assigned or simulated plans before payment
 processing is integrated.
 
-  Capability                 Free            Pro            Enterprise
-  -------------------------- --------------- -------------- ------------
-  Workspaces                 Limited         Expanded       Custom
-  Members                    Limited         Expanded       Custom
-  Document storage           Limited quota   Higher quota   Custom
-  Processing jobs            Limited quota   Higher quota   Custom
-  AI requests                Limited quota   Higher quota   Custom
-  Audit history              Basic           Advanced       Advanced
-  Dedicated infrastructure   No              No             Optional
+| Capability | Free | Pro | Enterprise |
+|---|---|---|---|
+| Isolation mode | **TenantPool** | **TenantBridge** | **TenantSilo** |
+| Application | Shared | Shared | Dedicated option |
+| Data boundary | Shared collections + tenant filters | Dedicated tenant database and vector/storage partitions on shared clusters | Dedicated tenant data plane |
+| Compute | Shared, quota-limited | Shared, tenant-aware scheduling | Dedicated worker pool |
+| Workspaces | Limited | Expanded | Custom |
+| Members | Limited | Expanded | Custom |
+| Document storage | Limited quota | Higher quota | Custom |
+| Processing jobs | Limited quota | Higher quota | Custom |
+| AI requests | Limited quota | Higher quota | Custom |
+| Audit history | Basic | Advanced | Advanced / configurable |
+| Support and operations | Standard | Enhanced | Contractual options |
 
 These are proposed product tiers, not published prices or finalized
 entitlements.
+
+The isolation modes are architectural entitlements, not authorization
+shortcuts. All tiers require verified membership, server-side RBAC,
+workspace permissions, permission-aware retrieval, tenant-aware cache and
+job handling, auditability, and automated cross-tenant isolation tests.
+Pro and Enterprise provide stronger resource boundaries; they do not
+replace application-level authorization.
+
+Implement TenantPool first. Build the tenant registry and data-plane
+abstraction early, then add TenantBridge provisioning and migration
+workflows. Implement TenantSilo after provisioning, backup, restore,
+observability, and isolation tests are reliable.
+
 
 Suggested usage dimensions:
 
@@ -587,6 +618,14 @@ Planned controls:
 -   Workspace restrictions are enforced within the same tenant.
 -   Tenant deletion removes or schedules deletion of associated records,
     objects, vectors, and cached data.
+-   TenantPool queries always apply tenant and workspace filters.
+-   TenantBridge requests resolve only that tenant's provisioned database,
+    vector collections, storage namespace, and queue namespace.
+-   TenantSilo credentials and network routes cannot access another
+    tenant's dedicated data plane.
+-   Subscription changes cannot switch isolation mode before migration
+    validation and commit.
+-   Missing or stale tenant registry metadata fails closed.
 
 ------------------------------------------------------------------------
 
@@ -677,6 +716,7 @@ evidenceos/
 │
 ├── services/
 │   ├── tenant/                   # Tenant provisioning and context
+│   ├── tenancy/                   # Isolation modes and data-plane routing
 │   ├── identity/                 # Authentication and authorization
 │   ├── billing/                  # Plans, subscriptions, usage
 │   ├── ingestion/                # Tenant-aware document ingestion
@@ -819,6 +859,7 @@ EvidenceOS is designed to demonstrate practical engineering across:
 
 ## Future Engineering and Research Directions
 
+-   TenantPool, TenantBridge, and TenantSilo provisioning and migration.
 -   Dedicated infrastructure for enterprise tenants.
 -   Confidence-aware selective prediction.
 -   Adaptive retrieval and query routing.
